@@ -1,0 +1,6 @@
+{
+  "name": "Cards Against Sanskar",
+  "description": "Multiplayer real-time Desi party game with custom deck management, live reactions, and hilarious cultural prompts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
