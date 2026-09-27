@@ -7,8 +7,10 @@ interface NavbarProps {
   playerCount?: number;
   onOpenDeckManager: () => void;
   onOpenRules: () => void;
+  onOpenServerSettings?: () => void;
   onLeaveRoom?: () => void;
   isConnected: boolean;
+  isStandaloneMode?: boolean;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -16,8 +18,10 @@ export const Navbar: React.FC<NavbarProps> = ({
   playerCount = 0,
   onOpenDeckManager,
   onOpenRules,
+  onOpenServerSettings,
   onLeaveRoom,
-  isConnected
+  isConnected,
+  isStandaloneMode = false
 }) => {
   const [soundOn, setSoundOn] = useState(isSoundEnabled());
   const [copied, setCopied] = useState(false);
@@ -87,13 +91,25 @@ export const Navbar: React.FC<NavbarProps> = ({
 
         {/* Actions */}
         <div className="flex items-center gap-1.5 sm:gap-2">
-          {/* Connection status indicator */}
-          <div
-            className={`w-2 h-2 rounded-full ${
-              isConnected ? 'bg-emerald-500 shadow-sm shadow-emerald-500/50' : 'bg-rose-500 animate-ping'
-            }`}
-            title={isConnected ? 'Connected to WebSocket server' : 'Reconnecting...'}
-          />
+          {/* Connection status indicator / Server settings toggle */}
+          <button
+            onClick={onOpenServerSettings}
+            className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-stone-900/60 hover:bg-stone-800 border border-stone-800 transition-colors text-xs text-stone-400"
+            title="Server Connection & Deployment Settings"
+          >
+            <div
+              className={`w-2 h-2 rounded-full ${
+                isConnected
+                  ? isStandaloneMode
+                    ? 'bg-amber-400 shadow-sm shadow-amber-400/50'
+                    : 'bg-emerald-500 shadow-sm shadow-emerald-500/50'
+                  : 'bg-rose-500 animate-ping'
+              }`}
+            />
+            <span className="hidden lg:inline text-[11px]">
+              {isStandaloneMode ? 'Standalone' : 'Live Server'}
+            </span>
+          </button>
 
           <button
             onClick={onOpenDeckManager}

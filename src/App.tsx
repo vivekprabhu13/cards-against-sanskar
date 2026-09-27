@@ -12,11 +12,13 @@ import { GameTable } from './components/GameTable';
 import { ChatAndReactions } from './components/ChatAndReactions';
 import { DeckManagerModal } from './components/DeckManagerModal';
 import { RulesModal } from './components/RulesModal';
+import { ServerSettingsModal } from './components/ServerSettingsModal';
 import { AlertCircle, X } from 'lucide-react';
 
 export default function App() {
   const {
     isConnected,
+    isStandaloneMode,
     roomState,
     myPlayerId,
     errorMessage,
@@ -42,6 +44,7 @@ export default function App() {
   // Modals state
   const [isDeckManagerOpen, setIsDeckManagerOpen] = useState(false);
   const [isRulesOpen, setIsRulesOpen] = useState(false);
+  const [isServerSettingsOpen, setIsServerSettingsOpen] = useState(false);
 
   // Check URL query parameters for ?room=XYZ
   const [initialRoomCode, setInitialRoomCode] = useState<string>('');
@@ -65,8 +68,10 @@ export default function App() {
         playerCount={roomState?.players.length}
         onOpenDeckManager={() => setIsDeckManagerOpen(true)}
         onOpenRules={() => setIsRulesOpen(true)}
+        onOpenServerSettings={() => setIsServerSettingsOpen(true)}
         onLeaveRoom={roomState ? leaveRoom : undefined}
         isConnected={isConnected}
+        isStandaloneMode={isStandaloneMode}
       />
 
       {/* Error Toast */}
@@ -142,6 +147,14 @@ export default function App() {
       <RulesModal
         isOpen={isRulesOpen}
         onClose={() => setIsRulesOpen(false)}
+      />
+
+      {/* Server & Deployment Settings Modal */}
+      <ServerSettingsModal
+        isOpen={isServerSettingsOpen}
+        onClose={() => setIsServerSettingsOpen(false)}
+        isStandaloneMode={isStandaloneMode}
+        isConnected={isConnected}
       />
     </div>
   );

@@ -2,14 +2,26 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { RoomState, ServerMessage, ClientMessage, LiveReaction, GameSettings } from '../types/game';
 import confetti from 'canvas-confetti';
 import { playDholakThump, playVictoryChime, playCardPlaySound, playChappalSlap } from '../utils/audio';
+import { clientGameEngine } from '../utils/clientEngine';
+
+function getBackendBaseUrl(): string {
+  if (typeof window === 'undefined') return '';
+  const custom = localStorage.getItem('sanskar_backend_url');
+  if (custom && custom.trim()) return custom.trim().replace(/\/$/, '');
+  const envUrl = (import.meta as any).env?.VITE_BACKEND_URL;
+  if (envUrl && envUrl.trim()) return envUrl.trim().replace(/\/$/, '');
+  return '';
+}
 
 export function useGameSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const isWsConnectedRef = useRef<boolean>(false);
+  const isClientEngineModeRef = useRef<boolean>(false);
 
   const [isConnected, setIsConnected] = useState<boolean>(true);
+  const [isStandaloneMode, setIsStandaloneMode] = useState<boolean>(false);
   const [roomState, setRoomState] = useState<RoomState | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string>(() => {
     return localStorage.getItem('sanskar_player_id') || '';
@@ -56,15 +68,56 @@ export function useGameSocket() {
     }
   }, []);
 
+  // Listen to ClientGameEngine updates (for Netlify / offline mode)
+  useEffect(() => {
+    const unsubscribe = clientGameEngine.subscribe((state, forPlayerId) => {
+      const activePid = localStorage.getItem('sanskar_player_id') || myPlayerId;
+      if (forPlayerId === activePid || !activePid) {
+        applyRoomStateUpdate(state, forPlayerId);
+      }
+    });
+
+    const unReaction = clientGameEngine.onReaction((reaction) => {
+      if (reaction.emoji === '🥿') {
+        playChappalSlap();
+      } else {
+        playDholakThump();
+      }
+      setFloatingReactions(prev => [...prev.slice(-15), reaction]);
+      setTimeout(() => {
+        setFloatingReactions(prev => prev.filter(r => r.id !== reaction.id));
+      }, 3000);
+    });
+
+    return () => {
+      unsubscribe();
+      unReaction();
+    };
+  }, [myPlayerId, applyRoomStateUpdate]);
+
   // HTTP Polling fallback function
   const pollRoomState = useCallback(async () => {
+    if (isClientEngineModeRef.current) {
+      const code = currentRoomCodeRef.current;
+      const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
+      if (code && pid) {
+        const localState = clientGameEngine.getRoomState(code, pid);
+        if (localState) {
+          applyRoomStateUpdate(localState, pid);
+        }
+      }
+      return;
+    }
+
     const code = currentRoomCodeRef.current;
     const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
     if (!code) return;
 
+    const base = getBackendBaseUrl();
     try {
-      const res = await fetch(`/api/room/${code}?playerId=${encodeURIComponent(pid)}`);
-      if (res.ok) {
+      const res = await fetch(`${base}/api/room/${code}?playerId=${encodeURIComponent(pid)}`);
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
         if (data.roomState) {
           applyRoomStateUpdate(data.roomState, data.yourPlayerId || pid);
@@ -79,12 +132,20 @@ export function useGameSocket() {
   // Connect via WebSocket
   const connectWs = useCallback(() => {
     if (typeof window === 'undefined') return;
+    if (isClientEngineModeRef.current) return;
     if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const base = getBackendBaseUrl();
+    let wsUrl: string;
+    if (base) {
+      const wsProto = base.startsWith('https') ? 'wss:' : 'ws:';
+      wsUrl = `${wsProto}//${base.replace(/^https?:\/\//, '')}/ws`;
+    } else {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsUrl = `${protocol}//${window.location.host}/ws`;
+    }
 
     try {
       const socket = new WebSocket(wsUrl);
@@ -95,7 +156,6 @@ export function useGameSocket() {
         setIsConnected(true);
         setErrorMessage(null);
 
-        // Rejoin room if previously active
         const savedRoom = localStorage.getItem('sanskar_room_code');
         const savedName = localStorage.getItem('sanskar_player_name');
         const savedAvatar = localStorage.getItem('sanskar_player_avatar');
@@ -140,26 +200,25 @@ export function useGameSocket() {
             }
           }
         } catch {
-          // Ignore malformed payloads
+          // Ignore
         }
       };
 
       socket.onclose = () => {
         isWsConnectedRef.current = false;
         wsRef.current = null;
-        // Reconnect after 3 seconds
-        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          connectWs();
-        }, 3000);
+        if (!isClientEngineModeRef.current) {
+          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = setTimeout(() => {
+            connectWs();
+          }, 4000);
+        }
       };
 
       socket.onerror = () => {
-        // Silently handle WS proxy/redirect in sandbox environments
         isWsConnectedRef.current = false;
       };
     } catch {
-      // WS not available in environment, fallback handles communication
       isWsConnectedRef.current = false;
     }
   }, [applyRoomStateUpdate]);
@@ -167,7 +226,6 @@ export function useGameSocket() {
   useEffect(() => {
     connectWs();
 
-    // Start polling interval fallback
     pollingIntervalRef.current = setInterval(() => {
       pollRoomState();
     }, 1500);
@@ -181,8 +239,17 @@ export function useGameSocket() {
     };
   }, [connectWs, pollRoomState]);
 
-  // Dispatch message via WebSocket with instant HTTP fallback
+  // Dispatch message via WebSocket with HTTP fallback and client engine fallback
   const send = useCallback(async (message: ClientMessage) => {
+    if (isClientEngineModeRef.current) {
+      const code = currentRoomCodeRef.current;
+      const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
+      if (code && pid) {
+        clientGameEngine.processAction(code, pid, message);
+      }
+      return;
+    }
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(message));
       return;
@@ -191,10 +258,11 @@ export function useGameSocket() {
     // HTTP API fallback
     const code = currentRoomCodeRef.current;
     const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
+    const base = getBackendBaseUrl();
 
     if (code && pid) {
       try {
-        const res = await fetch('/api/room/action', {
+        const res = await fetch(`${base}/api/room/action`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -203,15 +271,20 @@ export function useGameSocket() {
             message
           })
         });
-        if (res.ok) {
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
           const data = await res.json();
           if (data.roomState) {
             applyRoomStateUpdate(data.roomState, pid);
+            return;
           }
         }
       } catch {
-        // Handled silently
+        // Fallback to client engine if backend failed
       }
+
+      // If server action failed or wasn't available, try client engine
+      clientGameEngine.processAction(code, pid, message);
     }
   }, [myPlayerId, applyRoomStateUpdate]);
 
@@ -219,28 +292,45 @@ export function useGameSocket() {
     localStorage.setItem('sanskar_player_name', playerName);
     localStorage.setItem('sanskar_player_avatar', avatar);
 
+    // Try WebSocket if connected
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'CREATE_ROOM',
         payload: { playerName, avatar, roomCode: customCode }
       }));
-    } else {
-      // Fallback via HTTP
-      try {
-        const res = await fetch('/api/room/create', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ playerName, avatar, roomCode: customCode })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.roomState) {
-            applyRoomStateUpdate(data.roomState, data.playerId);
-          }
+      return;
+    }
+
+    // Try HTTP backend
+    const base = getBackendBaseUrl();
+    let backendSuccess = false;
+
+    try {
+      const res = await fetch(`${base}/api/room/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerName, avatar, roomCode: customCode })
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success && data.roomState) {
+          backendSuccess = true;
+          applyRoomStateUpdate(data.roomState, data.playerId);
+          return;
         }
-      } catch (err: any) {
-        setErrorMessage(err.message || 'Failed to create room');
       }
+    } catch {
+      // Backend not running (e.g. Netlify static hosting)
+    }
+
+    // NETLIFY / STATIC HOSTING FALLBACK:
+    // If backend is not available, automatically use the client game engine!
+    if (!backendSuccess) {
+      isClientEngineModeRef.current = true;
+      setIsStandaloneMode(true);
+      const result = clientGameEngine.createRoom(playerName, avatar, customCode);
+      applyRoomStateUpdate(result.roomState, result.playerId);
     }
   }, [applyRoomStateUpdate]);
 
@@ -251,6 +341,7 @@ export function useGameSocket() {
     localStorage.setItem('sanskar_room_code', cleanCode);
     currentRoomCodeRef.current = cleanCode;
 
+    // Try WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'JOIN_ROOM',
@@ -261,29 +352,49 @@ export function useGameSocket() {
           playerId: myPlayerId
         }
       }));
-    } else {
-      // Fallback via HTTP
-      try {
-        const res = await fetch('/api/room/join', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomCode: cleanCode,
-            playerName,
-            avatar,
-            playerId: myPlayerId
-          })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.roomState) {
-            applyRoomStateUpdate(data.roomState, data.playerId);
-          } else if (data.error) {
-            setErrorMessage(data.error);
-          }
+      return;
+    }
+
+    // Try HTTP backend
+    const base = getBackendBaseUrl();
+    let joinedBackend = false;
+
+    try {
+      const res = await fetch(`${base}/api/room/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomCode: cleanCode,
+          playerName,
+          avatar,
+          playerId: myPlayerId
+        })
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data.success && data.roomState) {
+          joinedBackend = true;
+          applyRoomStateUpdate(data.roomState, data.playerId);
+          return;
+        } else if (data.error) {
+          setErrorMessage(data.error);
+          return;
         }
-      } catch (err: any) {
-        setErrorMessage(err.message || 'Failed to join room');
+      }
+    } catch {
+      // Backend unavailable
+    }
+
+    // Try client engine fallback
+    if (!joinedBackend) {
+      const localResult = clientGameEngine.joinRoom(cleanCode, playerName, avatar, myPlayerId);
+      if (localResult.success && localResult.roomState) {
+        isClientEngineModeRef.current = true;
+        setIsStandaloneMode(true);
+        applyRoomStateUpdate(localResult.roomState, localResult.playerId);
+      } else {
+        setErrorMessage(localResult.error || `Could not find room "${cleanCode}". Make sure the room was created in this browser or connect a backend server.`);
       }
     }
   }, [myPlayerId, applyRoomStateUpdate]);
@@ -349,6 +460,7 @@ export function useGameSocket() {
 
   return {
     isConnected,
+    isStandaloneMode,
     roomState,
     myPlayerId,
     errorMessage,
