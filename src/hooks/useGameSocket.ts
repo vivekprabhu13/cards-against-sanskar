@@ -3,6 +3,7 @@ import { RoomState, ServerMessage, ClientMessage, LiveReaction, GameSettings } f
 import confetti from 'canvas-confetti';
 import { playDholakThump, playVictoryChime, playCardPlaySound, playChappalSlap } from '../utils/audio';
 import { clientGameEngine } from '../utils/clientEngine';
+import { cloudRelay } from '../utils/cloudRelay';
 
 function getBackendBaseUrl(): string {
   if (typeof window === 'undefined') return '';
@@ -23,6 +24,7 @@ export function useGameSocket() {
   const [isConnected, setIsConnected] = useState<boolean>(true);
   const [isStandaloneMode, setIsStandaloneMode] = useState<boolean>(false);
   const [roomState, setRoomState] = useState<RoomState | null>(null);
+  const roomStateRef = useRef<RoomState | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string>(() => {
     return localStorage.getItem('sanskar_player_id') || '';
   });
@@ -31,6 +33,7 @@ export function useGameSocket() {
   const currentRoomCodeRef = useRef<string>(localStorage.getItem('sanskar_room_code') || '');
 
   const applyRoomStateUpdate = useCallback((newState: RoomState, playerId?: string) => {
+    roomStateRef.current = newState;
     setRoomState(prev => {
       const previousPhase = prev?.phase;
       const newPhase = newState.phase;
@@ -68,16 +71,37 @@ export function useGameSocket() {
     }
   }, []);
 
-  // Listen to ClientGameEngine updates (for Netlify / offline mode)
+  // Listen to ClientGameEngine updates & CloudRelay updates (for cross-device mobile play on Netlify)
   useEffect(() => {
-    const unsubscribe = clientGameEngine.subscribe((state, forPlayerId) => {
+    const unsubscribeLocal = clientGameEngine.subscribe((state, forPlayerId) => {
       const activePid = localStorage.getItem('sanskar_player_id') || myPlayerId;
       if (forPlayerId === activePid || !activePid) {
         applyRoomStateUpdate(state, forPlayerId);
       }
     });
 
-    const unReaction = clientGameEngine.onReaction((reaction) => {
+    const unReactionLocal = clientGameEngine.onReaction((reaction) => {
+      if (reaction.emoji === '🥿') {
+        playChappalSlap();
+      } else {
+        playDholakThump();
+      }
+      setFloatingReactions(prev => [...prev.slice(-15), reaction]);
+      setTimeout(() => {
+        setFloatingReactions(prev => prev.filter(r => r.id !== reaction.id));
+      }, 3000);
+    });
+
+    // Cross-device sync via CloudRelay MQTT
+    const unsubscribeCloud = cloudRelay.subscribeToState((state, forPlayerId) => {
+      const activePid = localStorage.getItem('sanskar_player_id') || myPlayerId;
+      if (!forPlayerId || forPlayerId === activePid) {
+        applyRoomStateUpdate(state, activePid);
+        setIsConnected(true);
+      }
+    });
+
+    const unReactionCloud = cloudRelay.subscribeToReaction((reaction) => {
       if (reaction.emoji === '🥿') {
         playChappalSlap();
       } else {
@@ -90,8 +114,10 @@ export function useGameSocket() {
     });
 
     return () => {
-      unsubscribe();
-      unReaction();
+      unsubscribeLocal();
+      unReactionLocal();
+      unsubscribeCloud();
+      unReactionCloud();
     };
   }, [myPlayerId, applyRoomStateUpdate]);
 
@@ -101,9 +127,11 @@ export function useGameSocket() {
       const code = currentRoomCodeRef.current;
       const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
       if (code && pid) {
-        const localState = clientGameEngine.getRoomState(code, pid);
-        if (localState) {
-          applyRoomStateUpdate(localState, pid);
+        if (clientGameEngine.hasRoom(code)) {
+          const localState = clientGameEngine.getRoomState(code, pid);
+          if (localState) {
+            applyRoomStateUpdate(localState, pid);
+          }
         }
       }
       return;
@@ -239,13 +267,27 @@ export function useGameSocket() {
     };
   }, [connectWs, pollRoomState]);
 
-  // Dispatch message via WebSocket with HTTP fallback and client engine fallback
+  // Dispatch message via WebSocket, HTTP fallback, or multi-device CloudRelay
   const send = useCallback(async (message: ClientMessage) => {
+    const code = currentRoomCodeRef.current;
+    const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
+
     if (isClientEngineModeRef.current) {
-      const code = currentRoomCodeRef.current;
-      const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
-      if (code && pid) {
-        clientGameEngine.processAction(code, pid, message);
+      if (clientGameEngine.hasRoom(code)) {
+        if (code && pid) {
+          clientGameEngine.processAction(code, pid, message);
+        }
+      } else {
+        // Guest on another mobile phone: forward action over CloudRelay to Host
+        if (code && pid) {
+          cloudRelay.sendAction(code, {
+            fromPlayerId: pid,
+            roomCode: code,
+            type: message.type,
+            payload: (message as any).payload || {},
+            timestamp: Date.now()
+          });
+        }
       }
       return;
     }
@@ -256,10 +298,7 @@ export function useGameSocket() {
     }
 
     // HTTP API fallback
-    const code = currentRoomCodeRef.current;
-    const pid = localStorage.getItem('sanskar_player_id') || myPlayerId;
     const base = getBackendBaseUrl();
-
     if (code && pid) {
       try {
         const res = await fetch(`${base}/api/room/action`, {
@@ -280,11 +319,16 @@ export function useGameSocket() {
           }
         }
       } catch {
-        // Fallback to client engine if backend failed
+        // Backend not responsive, fallback to CloudRelay
       }
 
-      // If server action failed or wasn't available, try client engine
-      clientGameEngine.processAction(code, pid, message);
+      cloudRelay.sendAction(code, {
+        fromPlayerId: pid,
+        roomCode: code,
+        type: message.type,
+        payload: (message as any).payload || {},
+        timestamp: Date.now()
+      });
     }
   }, [myPlayerId, applyRoomStateUpdate]);
 
@@ -325,11 +369,13 @@ export function useGameSocket() {
     }
 
     // NETLIFY / STATIC HOSTING FALLBACK:
-    // If backend is not available, automatically use the client game engine!
+    // Uses browser client game engine & broadcasts on CloudRelay for cross-device multiplayer!
     if (!backendSuccess) {
       isClientEngineModeRef.current = true;
       setIsStandaloneMode(true);
       const result = clientGameEngine.createRoom(playerName, avatar, customCode);
+      currentRoomCodeRef.current = result.roomCode;
+      await cloudRelay.setRoom(result.roomCode);
       applyRoomStateUpdate(result.roomState, result.playerId);
     }
   }, [applyRoomStateUpdate]);
@@ -386,22 +432,72 @@ export function useGameSocket() {
       // Backend unavailable
     }
 
-    // Try client engine fallback
+    // MULTI-DEVICE CLOUD RELAY FALLBACK (For Netlify / Cross-Phone):
     if (!joinedBackend) {
-      const localResult = clientGameEngine.joinRoom(cleanCode, playerName, avatar, myPlayerId);
-      if (localResult.success && localResult.roomState) {
-        isClientEngineModeRef.current = true;
-        setIsStandaloneMode(true);
-        applyRoomStateUpdate(localResult.roomState, localResult.playerId);
-      } else {
-        setErrorMessage(localResult.error || `Could not find room "${cleanCode}". Make sure the room was created in this browser or connect a backend server.`);
+      // 1. Same-device / tab session check
+      if (clientGameEngine.hasRoom(cleanCode)) {
+        const localResult = clientGameEngine.joinRoom(cleanCode, playerName, avatar, myPlayerId);
+        if (localResult.success && localResult.roomState) {
+          isClientEngineModeRef.current = true;
+          setIsStandaloneMode(true);
+          applyRoomStateUpdate(localResult.roomState, localResult.playerId);
+          return;
+        }
       }
+
+      // 2. Cross-Device connection: The room is on another mobile phone!
+      isClientEngineModeRef.current = true;
+      setIsStandaloneMode(true);
+
+      const pid = myPlayerId || ('p_' + Math.random().toString(36).substring(2, 9));
+      setMyPlayerId(pid);
+      localStorage.setItem('sanskar_player_id', pid);
+
+      // Connect to the room's CloudRelay topic
+      await cloudRelay.setRoom(cleanCode);
+
+      // Send JOIN_REQUEST to the host's mobile phone
+      cloudRelay.sendAction(cleanCode, {
+        fromPlayerId: pid,
+        roomCode: cleanCode,
+        type: 'JOIN_REQUEST',
+        payload: { roomCode: cleanCode, playerName, avatar, playerId: pid },
+        timestamp: Date.now()
+      });
+      cloudRelay.sendQuery(cleanCode, pid);
+
+      // Query host over the mobile connection
+      let attempts = 0;
+      const joinInterval = setInterval(() => {
+        attempts++;
+        if (currentRoomCodeRef.current === cleanCode && roomStateRef.current?.code === cleanCode) {
+          clearInterval(joinInterval);
+          return;
+        }
+
+        cloudRelay.sendAction(cleanCode, {
+          fromPlayerId: pid,
+          roomCode: cleanCode,
+          type: 'JOIN_REQUEST',
+          payload: { roomCode: cleanCode, playerName, avatar, playerId: pid },
+          timestamp: Date.now()
+        });
+        cloudRelay.sendQuery(cleanCode, pid);
+
+        if (attempts >= 6) {
+          clearInterval(joinInterval);
+          if (roomStateRef.current?.code !== cleanCode) {
+            setErrorMessage(`Room "${cleanCode}" not found. Please verify the 5-letter code or ensure the host is online.`);
+          }
+        }
+      }, 1000);
     }
   }, [myPlayerId, applyRoomStateUpdate]);
 
   const leaveRoom = useCallback(() => {
     localStorage.removeItem('sanskar_room_code');
     currentRoomCodeRef.current = '';
+    roomStateRef.current = null;
     send({ type: 'LEAVE_ROOM' });
     setRoomState(null);
   }, [send]);
@@ -455,6 +551,17 @@ export function useGameSocket() {
   }, [send]);
 
   const sendReaction = useCallback((emoji: string) => {
+    const code = currentRoomCodeRef.current;
+    const name = localStorage.getItem('sanskar_player_name') || 'Sanskari Guest';
+    const rx: LiveReaction = {
+      id: 'rx_' + Math.random().toString(36).substring(2, 9),
+      emoji,
+      senderName: name,
+      timestamp: Date.now()
+    };
+    if (code) {
+      cloudRelay.sendReaction(code, rx);
+    }
     send({ type: 'SEND_REACTION', payload: { emoji } });
   }, [send]);
 

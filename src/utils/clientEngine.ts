@@ -13,6 +13,7 @@ import {
   ClientMessage
 } from '../types/game';
 import { DEFAULT_DECKS, WIN_COMMENTARIES, DESI_AVATARS } from '../data/defaultDecks';
+import { cloudRelay } from './cloudRelay';
 
 interface LocalRoom {
   code: string;
@@ -38,6 +39,7 @@ interface LocalRoom {
 
 export class ClientGameEngine {
   private rooms = new Map<string, LocalRoom>();
+  private heartbeats = new Map<string, any>();
   private channel: BroadcastChannel | null = null;
   private onStateChangeCallbacks = new Set<(roomState: RoomState, forPlayerId: string) => void>();
   private onReactionCallbacks = new Set<(reaction: LiveReaction) => void>();
@@ -60,6 +62,22 @@ export class ClientGameEngine {
         // BroadcastChannel unavailable
       }
     }
+
+    // Subscribe to multi-device CloudRelay actions
+    cloudRelay.subscribeToAction((action) => {
+      const code = action.roomCode?.toUpperCase().trim();
+      if (!code || !this.rooms.has(code)) return;
+      const room = this.rooms.get(code)!;
+
+      if (action.type === 'JOIN_REQUEST') {
+        const { playerName, avatar, playerId } = action.payload || {};
+        this.joinRoom(code, playerName, avatar, playerId);
+      } else if (action.type === 'QUERY_STATE') {
+        this.broadcastToCloud(room);
+      } else {
+        this.processAction(code, action.fromPlayerId, { type: action.type, payload: action.payload } as any, false);
+      }
+    });
   }
 
   public subscribe(cb: (roomState: RoomState, forPlayerId: string) => void) {
@@ -74,6 +92,42 @@ export class ClientGameEngine {
     return () => {
       this.onReactionCallbacks.delete(cb);
     };
+  }
+
+  public hasRoom(roomCode: string): boolean {
+    return this.rooms.has(roomCode.toUpperCase().trim());
+  }
+
+  private startHeartbeat(code: string) {
+    if (this.heartbeats.has(code)) {
+      clearInterval(this.heartbeats.get(code));
+    }
+    const interval = setInterval(() => {
+      const room = this.rooms.get(code);
+      if (!room) {
+        clearInterval(interval);
+        this.heartbeats.delete(code);
+        return;
+      }
+      this.broadcastToCloud(room);
+    }, 2500);
+    if ((interval as any).unref) {
+      (interval as any).unref();
+    }
+    this.heartbeats.set(code, interval);
+  }
+
+  private broadcastToCloud(room: LocalRoom) {
+    const statesByPlayer: Record<string, RoomState> = {};
+    for (const player of room.players) {
+      statesByPlayer[player.id] = this.sanitizeRoomStateForPlayer(room, player.id);
+    }
+    cloudRelay.broadcastState(room.code, {
+      statesByPlayer,
+      hostId: room.hostId,
+      roomCode: room.code,
+      timestamp: Date.now()
+    });
   }
 
   private notify(room: LocalRoom) {
@@ -97,6 +151,9 @@ export class ClientGameEngine {
         // Ignored
       }
     }
+
+    // Broadcast state across devices via CloudRelay
+    this.broadcastToCloud(room);
   }
 
   private handleRemoteRoomSync(remoteRoom: LocalRoom) {
@@ -192,6 +249,8 @@ export class ClientGameEngine {
     };
 
     this.rooms.set(code, room);
+    cloudRelay.setRoom(code);
+    this.startHeartbeat(code);
     this.addSystemMessage(room, `Swagatam! Room ${code} created by ${hostPlayer.name} (Client / Netlify Standalone Mode).`);
     this.notify(room);
     const sanitized = this.sanitizeRoomStateForPlayer(room, playerId);
@@ -217,7 +276,7 @@ export class ClientGameEngine {
       if (avatar) player.avatar = avatar;
       this.addSystemMessage(room, `${player.name} returned to the room.`);
     } else {
-      const newPlayerId = 'p_' + Math.random().toString(36).substring(2, 9);
+      const newPlayerId = existingPlayerId || ('p_' + Math.random().toString(36).substring(2, 9));
       player = {
         id: newPlayerId,
         name: (playerName || 'Sanskari Guest').trim().substring(0, 24),
